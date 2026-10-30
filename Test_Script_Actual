@@ -1,0 +1,160 @@
+from machine import Pin, UART
+import time
+import math
+from machine import Pin, PWM
+
+servo = PWM(Pin(16))
+servo.freq(50)
+
+#Sets the angle values on each end
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+
+#Custom pulse values
+MIN_US = 750   #Pulse width for 0 degrees
+MAX_US = 2500  #Pulse width for 180 degrees
+
+# Waveshare L76K Hardware Configuration
+uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1)) #Configures the pins, based on how the stack assigns them
+
+# Global variables to track state over time
+prev_lat = None #Sets the "previous latitude" to be used in the initial position and speed calculation
+prev_lon = None #Sets the "previous longitude" to be used in the initial position and speed calculation
+last_calc_time = time.ticks_ms() #Sets the last time calculated to the current date
+
+def convert_to_degrees(raw_val, direction):
+    #Converts NMEA DDMM.MMMMM format to standard Decimal Degrees
+    if not raw_val or raw_val == '':
+        return None
+    try:
+        dot_idx = raw_val.find('.') #Idnetifies where in the raw data the "." is
+        deg_len = dot_idx - 2 #Identifies the length of the position data as opposed to the time data
+        degrees = float(raw_val[:deg_len]) #Sets a variable equal to just the position data
+        minutes = float(raw_val[deg_len:]) #Sets a variable equal to just the time data
+        decimal_degrees = degrees + (minutes / 60.0) 
+        if direction in ['S', 'W']:
+            decimal_degrees = -decimal_degrees
+        return decimal_degrees
+    except:
+        return None
+def set_angle_precise(angle):
+    #Constrain input to safe boundaries
+    if angle < MIN_ANGLE: angle = MIN_ANGLE
+    if angle > MAX_ANGLE: angle = MAX_ANGLE
+    
+    #Maps the minimum and maximum angles
+    pulse_us = MIN_US + ((angle - MIN_ANGLE) * (MAX_US - MIN_US) / (MAX_ANGLE - MIN_ANGLE))
+    
+    #Convert microseconds to 16-bit duty cycle
+    duty = int((pulse_us / 20000) * 65535)
+    servo.duty_u16(duty)
+
+    
+def haversine_distance(lat1, lon1, lat2, lon2):
+    #Calculates the distance between two coordinates in meters
+    R = 6371000  #Radius of the Earth in meters
+    
+    # Convert decimal degrees to radians
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = (math.sin(delta_phi / 2) ** 2 +
+         math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    return R * c  # Distance in meters
+
+print("Speed Tracker Active. Reading coordinates...")
+
+current_line = ""
+
+while True:
+    set_angle_precise(0)
+    if uart.any():
+        raw_char = uart.read(1)
+        if raw_char:
+            try:
+                char = raw_char.decode('utf-8')
+                if char == '\n':
+                    line_str = current_line.strip()
+                    
+                    # Parse the RMC sentence
+                    if "$GNRMC" in line_str or "$GPRMC" in line_str:
+                        parts = line_str.split(',')
+                        
+                        # Only calculate if we hit our 3-second (3000ms) interval threshold
+                        current_time = time.ticks_ms()
+                        time_delta_ms = time.ticks_diff(current_time, last_calc_time)
+                        
+                        if time_delta_ms >= 1000: #Sets the timing between each "check" to 1000 MS, or 1 second
+                            # Verify valid GNSS status ('A' = Active Fix)
+                            if len(parts) > 6 and parts[2] == 'A':
+                                latitude = convert_to_degrees(parts[3], parts[4])
+                                longitude = convert_to_degrees(parts[5], parts[6])
+                                
+                                if latitude and longitude:
+                                    # Calculate time passed in seconds
+                                    time_seconds = time_delta_ms / 1000.0
+                                    
+                                    # Default speed is 0 if this is the first reading
+                                    speed_kmh = 0.0
+                                    speed_mph = 0.0
+                                    
+                                    if prev_lat is not None and prev_lon is not None:
+                                        # Calculate distance traveled in meters
+                                        distance_meters = haversine_distance(prev_lat, prev_lon, latitude, longitude)
+                                        
+                                        # Speed = Distance / Time (meters per second)
+                                        speed_mps = distance_meters / time_seconds
+                                        
+                                        # Convert to standard units
+                                        speed_kmh = speed_mps * 3.6
+                                        speed_mph = speed_mps * 2.23694
+                                        timer_start = None
+                                        servo_at_90 = False
+
+                                        # Example loop / function call
+                                        if speed_mph >= 4.0:
+                                            set_angle_precise(90)
+                                            servo_at_90 = True
+                                            timer_start = None  # Reset timer while speed is high
+
+                                        elif speed_mph <= 2.0 and servo_at_90:
+                                            if timer_start is None:
+                                                # Speed just dropped <= 2.0, start the 30-second countdown
+                                                timer_start = time.time()
+                                            elif time.time() - timer_start >= 30:
+                                                # 30 seconds have passed with speed <= 2.0
+                                                set_angle_precise(0)
+                                                servo_at_90 = False
+                                                timer_start = None
+
+                                        else:
+                                        # Optional: if speed is between 2.0 and 4.0, or if you want to cancel the timer if speed jumps back up
+                                            if 2.0 < speed_mph < 4.0:
+                                                timer_start = None
+                                    # Output the metrics
+                                    print(f"Latitude:  {latitude:.6f}")
+                                    print(f"Longitude: {longitude:.6f}")
+                                    print(f"Speed:     {speed_kmh:.1f} km/h  ({speed_mph:.1f} mph)")
+                                    print("-" * 30)
+                                    
+                                    # Save current coordinates and timestamp for the next loop cycle
+                                    prev_lat = latitude
+                                    prev_lon = longitude
+                                    last_calc_time = current_time
+                            else:
+                                print("Searching for satellites... (Fix lost)")
+                                last_calc_time = current_time # Reset timer to prevent flooding
+                                
+                    current_line = ""
+                else:
+                    current_line += char
+            except Exception as e:
+                pass
+                
+    time.sleep(0.001)
+
